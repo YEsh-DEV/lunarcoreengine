@@ -169,6 +169,14 @@ def _find_job_inputs(job_dir: Path) -> Tuple[Optional[str], Optional[str]]:
         except Exception:
             pass
 
+    # Direct search in input dir
+    input_dir = job_dir / "input"
+    if input_dir.exists():
+        files_a = sorted(list(input_dir.glob("upload_a_*")) + list(input_dir.glob("source.*")))
+        files_b = sorted(list(input_dir.glob("upload_b_*")) + list(input_dir.glob("reference.*")))
+        if files_a and files_b:
+            return str(files_a[0]), str(files_b[0])
+
     return None, None
 
 
@@ -210,6 +218,11 @@ def _execute_pipeline_task(job_id: str, img_a_path: str, img_b_path: str):
         pipeline = LunaMatchPipeline(job_id, img_a_path, img_b_path)
         result = pipeline.run()
         logger.info(f"Job {job_id} finished with status: {result.get('status')}")
+        if result.get("status") == "DONE":
+            try:
+                build_chatbot_summary(job_id)
+            except Exception as e_sum:
+                logger.warning(f"Summary pregeneration for {job_id}: {e_sum}")
     except Exception as e:
         logger.error(f"Execution error for job {job_id}: {e}")
         status_file = Path("data") / "jobs" / job_id / "status.json"
