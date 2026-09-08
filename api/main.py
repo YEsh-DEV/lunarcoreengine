@@ -185,7 +185,7 @@ def health_check():
     }
 
 
-def _ensure_memory_safe_image(file_path: str, max_dim: int = 640) -> str:
+def _ensure_memory_safe_image(file_path: str, max_dim: int = 480) -> str:
     """Ensure image does not exceed max_dim to avoid OOM on memory-limited production tiers."""
     try:
         arr = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
@@ -205,8 +205,8 @@ def _ensure_memory_safe_image(file_path: str, max_dim: int = 640) -> str:
 def _execute_pipeline_task(job_id: str, img_a_path: str, img_b_path: str):
     """Background runner for LunaMatchPipeline."""
     try:
-        _ensure_memory_safe_image(img_a_path, max_dim=640)
-        _ensure_memory_safe_image(img_b_path, max_dim=640)
+        _ensure_memory_safe_image(img_a_path, max_dim=480)
+        _ensure_memory_safe_image(img_b_path, max_dim=480)
         pipeline = LunaMatchPipeline(job_id, img_a_path, img_b_path)
         result = pipeline.run()
         logger.info(f"Job {job_id} finished with status: {result.get('status')}")
@@ -219,6 +219,9 @@ def _execute_pipeline_task(job_id: str, img_a_path: str, img_b_path: str):
                 json.dump({"status": "FAILED", "error": str(e)}, f)
         except Exception:
             pass
+    finally:
+        import gc
+        gc.collect()
 
 
 @app.post("/register", response_model=JobStatusResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -252,7 +255,7 @@ async def register_images(
             content = await file_a.read()
             with open(path_a, "wb") as f_out:
                 f_out.write(content)
-            _ensure_memory_safe_image(str(path_a), max_dim=640)
+            _ensure_memory_safe_image(str(path_a), max_dim=480)
             img_a_path = str(path_a)
         elif "img_a_path" in form:
             img_a_path = str(form.get("img_a_path"))
@@ -262,7 +265,7 @@ async def register_images(
             content = await file_b.read()
             with open(path_b, "wb") as f_out:
                 f_out.write(content)
-            _ensure_memory_safe_image(str(path_b), max_dim=640)
+            _ensure_memory_safe_image(str(path_b), max_dim=480)
             img_b_path = str(path_b)
         elif "img_b_path" in form:
             img_b_path = str(form.get("img_b_path"))
@@ -874,11 +877,11 @@ def orchestrate(req: OrchestrateRequest):
         # Memory safety: clamp max dimension to 768px for Render 512MB RAM
         for arr in [img_a, img_b]:
             pass
-        if max(img_a.shape) > 640:
-            s = 640.0 / max(img_a.shape)
+        if max(img_a.shape) > 480:
+            s = 480.0 / max(img_a.shape)
             img_a = cv2.resize(img_a, (max(1, int(img_a.shape[1] * s)), max(1, int(img_a.shape[0] * s))), interpolation=cv2.INTER_AREA)
-        if max(img_b.shape) > 640:
-            s = 640.0 / max(img_b.shape)
+        if max(img_b.shape) > 480:
+            s = 480.0 / max(img_b.shape)
             img_b = cv2.resize(img_b, (max(1, int(img_b.shape[1] * s)), max(1, int(img_b.shape[0] * s))), interpolation=cv2.INTER_AREA)
 
         job_id = f"job_{uuid.uuid4().hex[:10]}"
