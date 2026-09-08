@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline.orchestrator import LunaMatchPipeline, JobState
 from collections import defaultdict
-from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse, ChatbotSummaryResponse, ChatRequest, ChatResponse, ChatHistoryResponse
+from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse, ChatbotSummaryResponse, ChatRequest, ChatResponse, ChatHistoryResponse, AnalyzeResponse
 from core.ingest_preprocess import read_raster
 from core.summary_builder import build_chatbot_summary
 
@@ -572,4 +572,197 @@ def get_chat_history(job_id: str, session_id: Optional[str] = None):
         job_id=job_id,
         session_id=session_key,
         turns=turns,
+    )
+
+
+# ── Visual Analysis Endpoint ─────────────────────────────────────────────────
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+def analyze_registration(job_id: str, focus: str = "overall"):
+    """
+    One-shot visual analysis of a completed registration job.
+    Uses Groq LLM to provide scientific commentary on the registration quality.
+    Focus options: 'overall', 'tiepoints', 'residual'.
+    
+    Note: This endpoint provides text-based analysis using registration metrics.
+    Visual model support depends on Groq tier availability.
+    """
+    import time
+
+    # a) Load summary
+    summary_path = Path(f"data/jobs/{job_id}/output/summary.json")
+    if summary_path.exists():
+        try:
+            with open(summary_path, "r") as f:
+                summary = json.load(f)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to read summary: {e}")
+    else:
+        try:
+            summary = build_chatbot_summary(job_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to generate summary: {e}")
+
+    if summary.get("status") != "DONE":
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job {job_id} is not completed (current status: {summary.get('status')})"
+        )
+
+    # b) Pick image based on focus
+    focus_lower = focus.lower()
+    if focus_lower == "residual":
+        kind = "residual"
+        image_path = Path(f"data/jobs/{job_id}/output/residual_map.png")
+        analysis_context = "residual error heatmap showing spatial distribution of reprojection errors"
+    elif focus_lower == "tiepoints":
+        kind = "tiepoints"
+        image_path = Path(f"data/jobs/{job_id}/output/preview_tiepoints.png")
+        analysis_context = "tiepoints correspondence overlay showing keypoint match distribution"
+    else:  # overall / checkerboard
+        kind = "checkerboard"
+        image_path = Path(f"data/jobs/{job_id}/output/preview_checkerboard.png")
+        analysis_context = "checkerboard mosaic overlay comparing aligned images tile by tile"
+
+    # Ensure image exists (regenerate via preview endpoint logic if needed)
+    if not image_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Preview image for focus='{focus}' not found. Call GET /jobs/{job_id}/preview?kind={kind} first to generate it."
+        )
+
+    # c) Extract metrics for prompt
+    qa = summary.get("quality_assessment", {})
+    metrics = summary.get("metrics", {})
+    meta = summary.get("input_metadata", {})
+
+    grade = qa.get("grade", "N/A")
+    conf = qa.get("confidence_label", "N/A")
+    rmse = metrics.get("rmse_px")
+    rmse_str = f"{rmse:.4f}" if rmse is not None else "N/A"
+    inlier_ratio = metrics.get("inlier_ratio")
+    inlier_ratio_str = f"{inlier_ratio * 100:.1f}" if inlier_ratio is not None else "N/A"
+    n_inliers = metrics.get("n_inliers", 0)
+    n_total = metrics.get("n_total", 0)
+    sdi = metrics.get("sdi")
+    sdi_str = f"{sdi:.4f}" if sdi is not None else "N/A"
+    transform = metrics.get("transform_type", "homography")
+    scale_disp = meta.get("scale_disparity_ratio", 1.0)
+    solar_corr = meta.get("solar_correction_applied", False)
+    warnings_list = qa.get("warnings", [])
+    warnings_str = "; ".join(warnings_list) if warnings_list else "none"
+    reasoning = qa.get("reasoning", "")
+
+    # d) Build analysis prompt
+    prompt = f"""You are a lunar image registration analyst. Provide a brief scientific assessment of this registration result (under 120 words).
+
+You are analyzing the {analysis_context} for job: {job_id}
+
+The registration metrics are:
+- Grade: {grade} ({conf})
+- RMSE: {rmse_str} px (sub-pixel threshold: <0.5px)
+- Inlier ratio: {inlier_ratio_str}% ({n_inliers} verified out of {n_total} total keypoints)
+- SDI: {sdi_str} (spatial coverage; good = >0.6)
+- Transform: {transform}
+- Scale disparity: {scale_disp:.2f}x between sensors
+- Solar correction applied: {solar_corr}
+- Warnings: {warnings_str}
+
+Based on these metrics, provide your analysis:
+1. Whether the keypoint spatial distribution (SDI={sdi_str}) looks well-spread
+2. Whether the RMSE of {rmse_str}px indicates reliable sub-pixel alignment
+3. Whether the inlier ratio of {inlier_ratio_str}% indicates robust matching
+4. One-sentence conclusion on suitability for scientific lunar crater mapping.
+
+Be factual, concise, and reference the specific numbers above."""
+
+    # e) Check API key
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Chat not configured: GROQ_API_KEY missing"
+        )
+
+    # f) Try vision call first, fall back to text analysis
+    VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "")
+    TEXT_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+
+    t0 = time.time()
+    model_used = TEXT_MODEL
+
+    try:
+        from groq import Groq
+        client = Groq(api_key=api_key)
+
+        # Try vision model with image if configured and image exists
+        if VISION_MODEL and image_path.exists():
+            try:
+                import base64
+                with open(image_path, "rb") as f:
+                    img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+                response = client.chat.completions.create(
+                    model=VISION_MODEL,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{img_b64}"}
+                            },
+                            {"type": "text", "text": prompt}
+                        ]
+                    }],
+                    max_tokens=250,
+                    temperature=0.2,
+                )
+                visual_analysis = response.choices[0].message.content
+                model_used = VISION_MODEL
+            except Exception as vision_error:
+                logger.warning(f"Vision model failed ({VISION_MODEL}): {vision_error}. Falling back to text analysis.")
+                # Fall back to text-only analysis
+                response = client.chat.completions.create(
+                    model=TEXT_MODEL,
+                    messages=[{
+                        "role": "system",
+                        "content": "You are a lunar image registration analyst. Provide scientific metric-based analysis."
+                    }, {
+                        "role": "user",
+                        "content": prompt
+                    }],
+                    max_tokens=250,
+                    temperature=0.2,
+                )
+                visual_analysis = response.choices[0].message.content
+        else:
+            # Text-only analysis using metrics
+            response = client.chat.completions.create(
+                model=TEXT_MODEL,
+                messages=[{
+                    "role": "system",
+                    "content": "You are a lunar image registration analyst. Provide scientific metric-based analysis."
+                }, {
+                    "role": "user",
+                    "content": prompt
+                }],
+                max_tokens=250,
+                temperature=0.2,
+            )
+            visual_analysis = response.choices[0].message.content
+
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Groq API error: {str(e)}")
+
+    latency = round(time.time() - t0, 3)
+
+    # g) Return response
+    return AnalyzeResponse(
+        job_id=job_id,
+        visual_analysis=visual_analysis,
+        image_used=kind,
+        model_used=model_used,
+        latency_s=latency,
     )

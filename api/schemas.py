@@ -104,3 +104,12 @@ class ChatHistoryResponse(BaseModel):
     job_id: str
     session_id: str
     turns: List[Dict[str, str]] = []
+
+
+class AnalyzeResponse(BaseModel):
+    """Response payload from the /analyze endpoint."""
+    job_id: str
+    visual_analysis: str
+    image_used: str
+    model_used: str
+    latency_s: float

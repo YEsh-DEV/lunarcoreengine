@@ -194,3 +194,52 @@ def test_chat_missing_groq_api_key_returns_503(client, completed_job):
         })
         assert resp.status_code == 503
         assert "GROQ_API_KEY missing" in resp.json()["detail"]
+
+
+def test_analyze_completed_job_success(client, completed_job):
+    """POST /analyze with completed job returns 200 with correct shape."""
+    # Create the required preview image
+    import numpy as np
+    from PIL import Image as PILImage
+    out_dir = Path('data') / 'jobs' / completed_job / 'output'
+    img = PILImage.fromarray(np.zeros((64, 64, 3), dtype=np.uint8))
+    img.save(out_dir / 'preview_tiepoints.png')
+
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock(message=MagicMock(
+        content='Grade A with 89.2% inlier ratio indicates excellent alignment. SDI 0.8901 confirms well-distributed keypoints. Reliable for crater mapping.'
+    ))]
+
+    with patch.dict(os.environ, {'GROQ_API_KEY': 'mock_key'}),          patch('groq.Groq') as mock_groq:
+        mock_groq.return_value.chat.completions.create.return_value = mock_resp
+        resp = client.post('/analyze', params={'job_id': completed_job, 'focus': 'tiepoints'})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data['job_id'] == completed_job
+        assert 'visual_analysis' in data
+        assert 'Grade A' in data['visual_analysis']
+        assert data['image_used'] == 'tiepoints'
+        assert isinstance(data['latency_s'], float)
+
+
+def test_analyze_missing_job_returns_404(client):
+    """POST /analyze with missing job_id returns 404."""
+    with patch.dict(os.environ, {'GROQ_API_KEY': 'mock_key'}):
+        resp = client.post('/analyze', params={'job_id': 'nonexistent_xyz_analyze_001', 'focus': 'overall'})
+        assert resp.status_code == 404
+        assert 'not found' in resp.json()['detail'].lower()
+
+
+def test_analyze_missing_groq_key_returns_503(client, completed_job):
+    """POST /analyze returns 503 when GROQ_API_KEY is not set."""
+    import numpy as np
+    from PIL import Image as PILImage
+    out_dir = Path('data') / 'jobs' / completed_job / 'output'
+    img = PILImage.fromarray(np.zeros((64, 64, 3), dtype=np.uint8))
+    img.save(out_dir / 'preview_checkerboard.png')
+
+    with patch.dict(os.environ, {}, clear=True):
+        resp = client.post('/analyze', params={'job_id': completed_job, 'focus': 'overall'})
+        assert resp.status_code == 503
+        assert 'GROQ_API_KEY missing' in resp.json()['detail']

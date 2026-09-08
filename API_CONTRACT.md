@@ -253,3 +253,27 @@ Host: localhost:8000
   ]
 }
 ```
+
+
+---
+
+## 8. POST /analyze
+
+One-shot scientific analysis of a completed registration job using Groq LLM.
+Analyzes the registration metrics and provides detailed commentary on spatial coverage, alignment accuracy, and suitability for crater mapping.
+
+### Request Parameters (Query String)
+`POST /analyze?job_id={job_id}&focus={focus}`
+
+| Parameter | Options | Description |
+| :--- | :--- | :--- |
+| `job_id` | — | Completed job identifier (required) |
+| `focus` | `tiepoints` \| `residual` \| `overall` | Analysis aspect (default: `overall`) |
+
+### Latency
+1.3 to 2.8 seconds
+
+### cURL Example:
+```bash
+curl -s -X POST "https://lunarcoreengine.onrender.com/analyze?job_id=job_abc123&focus=tiepoints"
+```
