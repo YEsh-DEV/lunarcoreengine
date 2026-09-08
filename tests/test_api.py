@@ -243,3 +243,45 @@ def test_analyze_missing_groq_key_returns_503(client, completed_job):
         resp = client.post('/analyze', params={'job_id': completed_job, 'focus': 'overall'})
         assert resp.status_code == 503
         assert 'GROQ_API_KEY missing' in resp.json()['detail']
+
+
+
+def test_orchestrate_general_knowledge(client):
+    """POST /orchestrate with query returns general_knowledge intent."""
+    resp = client.post('/orchestrate', json={'query': 'What is LUNA-MATCH?'})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data['intent'] == 'general_knowledge'
+    assert 'text_response' in data
+    assert len(data['text_response']) > 0
+
+
+def test_orchestrate_explain_registration(client):
+    """POST /orchestrate with current_registration returns explain_registration intent."""
+    req = {
+        'query': 'Is this alignment accurate?',
+        'current_registration': {
+            'status': 'success',
+            'total_matches': 500,
+            'inliers': 400,
+            'inlier_ratio': 0.8,
+            'rmse': 0.35,
+            'subpixel_accuracy': True
+        }
+    }
+    resp = client.post('/orchestrate', json=req)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data['intent'] == 'explain_registration'
+    assert data['registration_result'] is not None
+    assert 'text_response' in data
+
+
+def test_orchestrate_register_images_invalid_b64(client):
+    """POST /orchestrate with invalid b64 returns 400."""
+    req = {
+        'source_image_b64': 'invalid_base64_data',
+        'reference_image_b64': 'invalid_base64_data'
+    }
+    resp = client.post('/orchestrate', json=req)
+    assert resp.status_code == 400

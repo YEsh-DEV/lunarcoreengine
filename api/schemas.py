@@ -113,3 +113,21 @@ class AnalyzeResponse(BaseModel):
     image_used: str
     model_used: str
     latency_s: float
+
+
+class OrchestrateRequest(BaseModel):
+    """Request payload for /orchestrate endpoint from frontend."""
+    query: Optional[str] = Field(None, description="User query or prompt")
+    source_image_b64: Optional[str] = Field(None, description="Base64 encoded source lunar image")
+    reference_image_b64: Optional[str] = Field(None, description="Base64 encoded reference lunar image")
+    current_registration: Optional[Dict[str, Any]] = Field(None, description="Prior registration result for follow-up chat")
+    registration_result: Optional[Dict[str, Any]] = Field(None, description="Alias for current_registration")
+
+
+class OrchestrateResponse(BaseModel):
+    """Response payload from /orchestrate endpoint for frontend."""
+    intent: str
+    text_response: str
+    registration_result: Optional[Dict[str, Any]] = None
+    sources: List[Dict[str, Any]] = []
+    tools_called: List[str] = []

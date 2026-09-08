@@ -12,6 +12,7 @@ Exposes core endpoints:
 """
 
 import os
+import base64
 import json
 import uuid
 import logging
@@ -28,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline.orchestrator import LunaMatchPipeline, JobState
 from collections import defaultdict
-from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse, ChatbotSummaryResponse, ChatRequest, ChatResponse, ChatHistoryResponse, AnalyzeResponse
+from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse, ChatbotSummaryResponse, ChatRequest, ChatResponse, ChatHistoryResponse, AnalyzeResponse, OrchestrateRequest, OrchestrateResponse
 from core.ingest_preprocess import read_raster
 from core.summary_builder import build_chatbot_summary
 
@@ -63,7 +64,14 @@ chat_sessions: dict[str, list[dict]] = defaultdict(list)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "*",
+        "https://luna-match-sih.vercel.app",
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+    ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -777,3 +785,251 @@ Be factual, concise, and reference the specific numbers above."""
         model_used=model_used,
         latency_s=latency,
     )
+
+
+def _decode_b64_image(b64_str: Optional[str]) -> Optional[np.ndarray]:
+    """Decode a base64 data URI or raw base64 string into a grayscale OpenCV numpy array."""
+    if not b64_str:
+        return None
+    try:
+        if "," in b64_str:
+            b64_str = b64_str.split(",", 1)[1]
+        data = base64.b64decode(b64_str)
+        arr = np.frombuffer(data, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+        if img is not None and img.ndim == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return img
+    except Exception as e:
+        logger.warning(f"Failed to decode base64 image: {e}")
+        return None
+
+
+def _encode_b64_image(img: np.ndarray) -> str:
+    """Encode an image numpy array into a PNG data URI string."""
+    if img is None:
+        return ""
+    if img.dtype != np.uint8:
+        norm = (img - np.nanmin(img)) / max(np.nanmax(img) - np.nanmin(img), 1e-6)
+        img_u8 = (np.clip(norm, 0, 1) * 255.0).astype(np.uint8)
+    else:
+        img_u8 = img
+    success, buffer = cv2.imencode(".png", img_u8)
+    if not success:
+        return ""
+    b64_bytes = base64.b64encode(buffer).decode("utf-8")
+    return f"data:image/png;base64,{b64_bytes}"
+
+
+@app.post("/orchestrate", response_model=OrchestrateResponse, tags=["orchestrate"])
+def orchestrate(req: OrchestrateRequest):
+    """
+    Unified AI Orchestrator endpoint for frontend chat & analysis workspace.
+    Supports:
+    1. Image registration: accepts source_image_b64 and reference_image_b64
+    2. Metric explanation & follow-up Q&A: accepts query + current_registration
+    3. General lunar science knowledge Q&A
+    """
+    query = (req.query or "").strip()
+    source_b64 = req.source_image_b64
+    ref_b64 = req.reference_image_b64
+    current_reg = req.current_registration or req.registration_result
+
+    # ── CASE 1: Image Registration ──────────────────────────────────────────
+    if source_b64 and ref_b64:
+        img_a = _decode_b64_image(source_b64)
+        img_b = _decode_b64_image(ref_b64)
+
+        if img_a is None or img_b is None:
+            raise HTTPException(status_code=400, detail="Could not decode one or both base64 images.")
+
+        job_id = f"job_{uuid.uuid4().hex[:10]}"
+        job_dir = Path("data") / "jobs" / job_id
+        input_dir = job_dir / "input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+
+        path_a = input_dir / "source.png"
+        path_b = input_dir / "reference.png"
+        cv2.imwrite(str(path_a), img_a)
+        cv2.imwrite(str(path_b), img_b)
+
+        pipeline = LunaMatchPipeline(job_id, str(path_a), str(path_b))
+        pipeline_res = pipeline.run()
+
+        summary = build_chatbot_summary(job_id)
+        m = summary.get("metrics", {})
+        qa = summary.get("quality_assessment", {})
+
+        total_matches = int(m.get("n_total", 0))
+        inliers = int(m.get("n_inliers", 0))
+        inlier_ratio = float(m.get("inlier_ratio", 0.0))
+        rmse = float(m.get("rmse_px", 0.0))
+        subpixel_acc = rmse < 1.0
+
+        # Build preview artifacts in base64
+        registered_b64 = ""
+        overlay_b64 = ""
+        match_b64 = ""
+
+        # Registered image
+        reg_npy_path = job_dir / "output" / "registered.npy"
+        reg_tif_path = job_dir / "output" / "registered.tif"
+        reg_img = None
+        if reg_npy_path.exists():
+            reg_img = np.load(str(reg_npy_path))
+        elif reg_tif_path.exists() and _HAS_RASTERIO:
+            with rasterio.open(str(reg_tif_path)) as src:
+                reg_img = src.read(1).astype(np.float64)
+
+        if reg_img is not None:
+            registered_b64 = _encode_b64_image(reg_img)
+            # Checkerboard overlay
+            raw_a, _ = read_raster(str(path_a))
+            checker = create_checkerboard(raw_a, reg_img, tile_size=36)
+            overlay_b64 = _encode_b64_image(checker)
+
+        # Tie points matches
+        matches_npy = job_dir / "intermediate" / "matches_verified.npy"
+        if not matches_npy.exists():
+            matches_npy = job_dir / "intermediate" / "matches_raw.npy"
+        if matches_npy.exists():
+            try:
+                matches_arr = np.load(str(matches_npy))
+                raw_a, _ = read_raster(str(path_a))
+                raw_b, _ = read_raster(str(path_b))
+                tp_img = draw_tie_points(raw_a, raw_b, matches_arr)
+                match_b64 = _encode_b64_image(tp_img)
+            except Exception as e:
+                logger.warning(f"Failed to generate tie-points visualization: {e}")
+
+        # Text explanation
+        groq_key = os.environ.get("GROQ_API_KEY")
+        text_resp = qa.get("reasoning", "")
+        if groq_key:
+            try:
+                from groq import Groq
+                client = Groq(api_key=groq_key)
+                prompt = (
+                    f"You are the LUNA-MATCH AI assistant for ISRO Chandrayaan-2 lunar image registration.\n"
+                    f"A registration job just finished with these metrics:\n"
+                    f"- Grade: {qa.get('grade')}\n"
+                    f"- Confidence: {qa.get('confidence_label')}\n"
+                    f"- Inliers: {inliers}/{total_matches} ({inlier_ratio*100:.1f}%)\n"
+                    f"- RMSE: {rmse:.3f} px (Sub-pixel: {subpixel_acc})\n"
+                    f"Explain this result clearly to a planetary scientist in 2 concise paragraphs. "
+                    f"Mention the alignment quality and whether it is safe for DEM/orthorectification."
+                )
+                groq_model = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+                completion = client.chat.completions.create(
+                    model=groq_model,
+                    messages=[
+                        {"role": "system", "content": "You are an expert planetary remote sensing specialist at ISRO."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=400,
+                    temperature=0.3,
+                )
+                text_resp = completion.choices[0].message.content.strip()
+            except Exception as e:
+                logger.warning(f"Groq explanation failed: {e}")
+
+        reg_result = {
+            "status": "success" if pipeline_res.get("status") == JobState.DONE.value else "failed",
+            "job_id": job_id,
+            "total_matches": total_matches,
+            "inliers": inliers,
+            "outliers": max(0, total_matches - inliers),
+            "inlier_ratio": inlier_ratio,
+            "rmse": rmse,
+            "subpixel_error": rmse,
+            "subpixel_accuracy": subpixel_acc,
+            "transformation_matrix": pipeline_res.get("transform"),
+            "registered_image": registered_b64,
+            "overlay_image": overlay_b64,
+            "match_points_image": match_b64,
+        }
+
+        return OrchestrateResponse(
+            intent="register_images",
+            text_response=text_resp,
+            registration_result=reg_result,
+            sources=[],
+            tools_called=["register_images"],
+        )
+
+    # ── CASE 2: Follow-up question on existing registration ─────────────────
+    elif current_reg:
+        groq_key = os.environ.get("GROQ_API_KEY")
+        user_query = query or "Explain the registration metrics."
+        text_resp = (
+            f"The current registration achieved an RMSE of {current_reg.get('rmse', 'N/A')} "
+            f"with {current_reg.get('inliers', 'N/A')} confirmed inliers. "
+            f"Sub-pixel accuracy is {'verified' if current_reg.get('subpixel_accuracy') else 'unverified'}."
+        )
+        if groq_key:
+            try:
+                from groq import Groq
+                client = Groq(api_key=groq_key)
+                context = (
+                    f"Registration metrics:\n"
+                    f"- Matches: {current_reg.get('total_matches')}\n"
+                    f"- Inliers: {current_reg.get('inliers')}\n"
+                    f"- Ratio: {current_reg.get('inlier_ratio')}\n"
+                    f"- RMSE: {current_reg.get('rmse')} px\n"
+                    f"- Sub-pixel accuracy: {current_reg.get('subpixel_accuracy')}\n"
+                )
+                groq_model = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+                completion = client.chat.completions.create(
+                    model=groq_model,
+                    messages=[
+                        {"role": "system", "content": "You are LUNA-MATCH AI assistant, an expert in lunar surface registration and photometry. Answer scientifically and directly."},
+                        {"role": "user", "content": f"{context}\nQuestion: {user_query}"}
+                    ],
+                    max_tokens=400,
+                    temperature=0.3,
+                )
+                text_resp = completion.choices[0].message.content.strip()
+            except Exception as e:
+                logger.warning(f"Groq chat failed: {e}")
+
+        return OrchestrateResponse(
+            intent="explain_registration",
+            text_response=text_resp,
+            registration_result=current_reg,
+            sources=[],
+            tools_called=["explain_registration"],
+        )
+
+    # ── CASE 3: General lunar science chat ──────────────────────────────────
+    else:
+        user_query = query or "What is LUNA-MATCH?"
+        groq_key = os.environ.get("GROQ_API_KEY")
+        text_resp = (
+            "LUNA-MATCH is an automated sub-pixel image registration and cross-modal alignment system "
+            "designed for Chandrayaan-2 planetary imagery (OHRC, TMC-2, IIRS) and reference basemaps."
+        )
+        if groq_key:
+            try:
+                from groq import Groq
+                client = Groq(api_key=groq_key)
+                groq_model = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+                completion = client.chat.completions.create(
+                    model=groq_model,
+                    messages=[
+                        {"role": "system", "content": "You are LUNA-MATCH AI assistant, an expert in Chandrayaan-2 lunar payloads (OHRC, TMC-2, IIRS) and planetary image correspondence."},
+                        {"role": "user", "content": user_query}
+                    ],
+                    max_tokens=400,
+                    temperature=0.3,
+                )
+                text_resp = completion.choices[0].message.content.strip()
+            except Exception as e:
+                logger.warning(f"Groq chat failed: {e}")
+
+        return OrchestrateResponse(
+            intent="general_knowledge",
+            text_response=text_resp,
+            registration_result=None,
+            sources=[],
+            tools_called=[],
+        )
