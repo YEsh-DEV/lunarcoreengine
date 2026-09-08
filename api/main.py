@@ -26,7 +26,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from pipeline.orchestrator import LunaMatchPipeline, JobState
-from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse, ChatbotSummaryResponse
+from collections import defaultdict
+from api.schemas import RegisterRequest, JobStatusResponse, JobResultResponse, ChatbotSummaryResponse, ChatRequest, ChatResponse, ChatHistoryResponse
 from core.ingest_preprocess import read_raster
 from core.summary_builder import build_chatbot_summary
 
@@ -46,6 +47,9 @@ app = FastAPI(
 )
 
 # Enable CORS for frontend workbench integration
+# In-memory session store for multi-turn chat
+chat_sessions: dict[str, list[dict]] = defaultdict(list)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -442,3 +446,130 @@ def get_job_preview(job_id: str, kind: str = "registered"):
         return FileResponse(str(npy_path), media_type="application/octet-stream")
 
     raise HTTPException(status_code=404, detail=f"Preview kind '{kind}' not found or output missing.")
+
+
+
+# ── Chat & Interactive Follow-Up Endpoints ────────────────────────────────────
+
+@app.post("/chat", response_model=ChatResponse)
+def chat_with_registration(req: ChatRequest):
+    """
+    Interactive conversational assistant grounded in registration telemetry.
+    Uses Groq LLM (llama-3.3-70b-versatile) for low-latency reasoning.
+    """
+    job_id = req.job_id
+    session_key = req.session_id or job_id
+    message = req.message
+
+    # a) Load the job's summary from disk
+    summary_path = Path(f"data/jobs/{job_id}/output/summary.json")
+    if summary_path.exists():
+        try:
+            with open(summary_path, "r") as f:
+                summary = json.load(f)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to read summary file: {e}")
+    else:
+        try:
+            summary = build_chatbot_summary(job_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to generate summary: {e}")
+
+    if summary.get("status") != "DONE":
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job {job_id} is not completed (current status: {summary.get('status')})"
+        )
+
+    # b) Build system prompt
+    qa = summary.get("quality_assessment", {})
+    metrics = summary.get("metrics", {})
+    meta = summary.get("input_metadata", {})
+
+    grade = qa.get("grade", "N/A")
+    conf = qa.get("confidence_label", "N/A")
+    rmse = metrics.get("rmse_px")
+    rmse_str = f"{rmse:.4f}" if rmse is not None else "N/A"
+    inlier_ratio = metrics.get("inlier_ratio")
+    inlier_ratio_str = f"{inlier_ratio * 100:.1f}" if inlier_ratio is not None else "N/A"
+    n_inliers = metrics.get("n_inliers", 0)
+    n_total = metrics.get("n_total", 0)
+    sdi = metrics.get("sdi")
+    sdi_str = f"{sdi:.4f}" if sdi is not None else "N/A"
+    transform = metrics.get("transform_type", "homography")
+    scale_disp = meta.get("scale_disparity_ratio", 1.0)
+    solar_corr = meta.get("solar_correction_applied", False)
+    warnings = qa.get("warnings", [])
+    warnings_str = '; '.join(warnings) if warnings else 'none'
+    reasoning = qa.get("reasoning", "")
+
+    system = f"""You are LUNA-MATCH, a scientific assistant for lunar image registration. You have access to the results of a completed registration job. Answer the scientist's questions about these results accurately and concisely. Do not invent numbers — only reference the metrics below.
+
+Registration summary:
+- Grade: {grade} ({conf})
+- RMSE: {rmse_str} px (sub-pixel = <0.5px, good)
+- Inlier ratio: {inlier_ratio_str}% (robust = >30%, excellent = >80%)
+- Inliers: {n_inliers} / {n_total} keypoint matches verified
+- SDI: {sdi_str} (spatial coverage, good = >0.6)
+- Transform: {transform}
+- Scale disparity: {scale_disp:.2f}x between sensors
+- Solar correction applied: {solar_corr}
+- Warnings: {warnings_str}
+- Scientific reasoning: {reasoning}
+
+Keep answers under 150 words unless the scientist asks for more detail.
+If asked about something outside these metrics, say you can only discuss this specific registration result."""
+
+    # c) Build conversation history
+    history = chat_sessions[session_key]
+    messages = history + [{"role": "user", "content": message}]
+
+    # d) Call Groq
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Chat not configured: GROQ_API_KEY missing"
+        )
+
+    try:
+        from groq import Groq
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model=os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b"),
+            messages=[{"role": "system", "content": system}] + messages,
+            max_tokens=300,
+            temperature=0.3,
+        )
+        reply = response.choices[0].message.content
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Groq API error: {str(e)}")
+
+    # e) Save turn to history
+    chat_sessions[session_key].append({"role": "user", "content": message})
+    chat_sessions[session_key].append({"role": "assistant", "content": reply})
+
+    # f) Return response
+    turn = len(chat_sessions[session_key]) // 2
+    return ChatResponse(
+        session_id=session_key,
+        reply=reply,
+        turn=turn,
+        job_id=job_id,
+    )
+
+
+@app.get("/chat/{job_id}/history", response_model=ChatHistoryResponse)
+def get_chat_history(job_id: str, session_id: Optional[str] = None):
+    """
+    Retrieve conversation history so frontend can restore chat on page reload.
+    """
+    session_key = session_id or job_id
+    turns = chat_sessions.get(session_key, [])
+    return ChatHistoryResponse(
+        job_id=job_id,
+        session_id=session_key,
+        turns=turns,
+    )

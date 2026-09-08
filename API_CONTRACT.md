@@ -197,3 +197,59 @@ Serve binary image streams of generated artifacts and visualization overlays for
 ```bash
 curl -s "http://localhost:8000/jobs/job_949cee5a6d/preview?kind=checkerboard" -o checkerboard.png
 ```
+
+
+---
+
+## 6. POST /chat
+
+Interactive conversational assistant grounded in registration telemetry. Uses Groq LLM for low-latency (< 1s) scientific interpretation and multi-turn follow-up Q&A.
+
+### Request Body (JSON)
+```json
+{
+  "job_id": "job_949cee5a6d",
+  "message": "Is this result reliable?",
+  "session_id": "job_949cee5a6d"
+}
+```
+
+### Response (Real Output Captured from Live Groq Run)
+- **Status**: `200 OK`
+- **Content-Type**: `application/json`
+
+```json
+{
+  "session_id": "job_949cee5a6d",
+  "reply": "Yes, this result is highly reliable. It received an A grade (high confidence) based on several key metrics: RMSE is 0.3284 px (sub-pixel), inlier ratio is 89.2% (514 verified matches), and Spatial Distribution Index (SDI) is 0.8901, indicating solid spatial coverage.",
+  "turn": 1,
+  "job_id": "job_949cee5a6d"
+}
+```
+
+---
+
+## 7. GET /chat/{job_id}/history
+
+Retrieve conversation history for a job/session to restore chat state on frontend page reload.
+
+### Request
+```http
+GET /chat/job_949cee5a6d/history HTTP/1.1
+Host: localhost:8000
+```
+
+### Response
+- **Status**: `200 OK`
+- **Content-Type**: `application/json`
+
+```json
+{
+  "job_id": "job_949cee5a6d",
+  "session_id": "job_949cee5a6d",
+  "turns": [
+    {"role": "user", "content": "Is this result reliable?"},
+    {"role": "assistant", "content": "Yes, this result is highly reliable..."}
+  ]
+}
+```

@@ -82,3 +82,25 @@ class ChatbotSummaryResponse(BaseModel):
     input_metadata: InputMetadataSchema
     artifacts: ArtifactsSchema
 
+
+
+class ChatRequest(BaseModel):
+    """Request payload for the /chat endpoint."""
+    job_id: str = Field(..., description="Completed job identifier to chat about")
+    message: str = Field(..., description="User question or prompt")
+    session_id: Optional[str] = Field(None, description="Optional conversation session ID (defaults to job_id)")
+
+
+class ChatResponse(BaseModel):
+    """Response payload from the /chat endpoint."""
+    session_id: str
+    reply: str
+    turn: int
+    job_id: str
+
+
+class ChatHistoryResponse(BaseModel):
+    """Conversation history for a given job or session."""
+    job_id: str
+    session_id: str
+    turns: List[Dict[str, str]] = []

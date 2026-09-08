@@ -68,3 +68,129 @@ def test_api_get_job_result_nonexistent(client):
     """GET /jobs/{id}/result returns 404 for nonexistent job."""
     resp = client.get("/jobs/nonexistent_id_999/result")
     assert resp.status_code == 404
+
+
+from pathlib import Path
+import json
+from unittest.mock import patch, MagicMock
+
+
+@pytest.fixture
+def completed_job():
+    job_id = "test_completed_job_chat_001"
+    job_dir = Path("data") / "jobs" / job_id
+    out_dir = job_dir / "output"
+    in_dir = job_dir / "input"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    in_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(job_dir / "status.json", "w") as f:
+        json.dump({"job_id": job_id, "status": "DONE", "elapsed_s": 1.25}, f)
+
+    with open(out_dir / "metrics.json", "w") as f:
+        json.dump({
+            "rmse_px": 0.3284,
+            "inlier_ratio": 0.8924,
+            "sdi": 0.8901,
+            "transform": "homography",
+            "n_inliers": 514,
+            "n_total": 576,
+            "elapsed_s": 1.25,
+        }, f)
+
+    with open(in_dir / "metadata.json", "w") as f:
+        json.dump({
+            "img_a_path": "moving.tif",
+            "img_b_path": "ref.tif",
+            "image_a": {"gsd": "100.0"},
+            "image_b": {"gsd": "150.0"},
+        }, f)
+
+    yield job_id
+
+    import shutil
+    shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def test_chat_completed_job_success(client, completed_job):
+    """POST /chat with completed job returns 200 with correct response shape."""
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock(message=MagicMock(content="Registration accuracy is Grade A with sub-pixel RMSE 0.3284 px."))]
+
+    with patch.dict(os.environ, {"GROQ_API_KEY": "mock_key"}),          patch("groq.Groq") as mock_groq:
+        mock_groq.return_value.chat.completions.create.return_value = mock_resp
+
+        resp = client.post("/chat", json={
+            "job_id": completed_job,
+            "message": "Is this result reliable for crater mapping?",
+        })
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["job_id"] == completed_job
+        assert data["session_id"] == completed_job
+        assert data["turn"] >= 1
+        assert "Grade A" in data["reply"]
+
+
+def test_chat_missing_job_returns_404(client):
+    """POST /chat with missing job_id returns 404."""
+    with patch.dict(os.environ, {"GROQ_API_KEY": "mock_key"}):
+        resp = client.post("/chat", json={
+            "job_id": "nonexistent_job_xyz999",
+            "message": "What is the error?",
+        })
+        assert resp.status_code == 404
+        assert "not found" in resp.json()["detail"].lower()
+
+
+def test_chat_history_grows_after_turns(client, completed_job):
+    """Conversation history grows correctly after turns and is queryable via GET /chat/{id}/history."""
+    mock_resp1 = MagicMock()
+    mock_resp1.choices = [MagicMock(message=MagicMock(content="First reply."))]
+    mock_resp2 = MagicMock()
+    mock_resp2.choices = [MagicMock(message=MagicMock(content="Second reply."))]
+
+    session_id = f"session_{completed_job}"
+
+    with patch.dict(os.environ, {"GROQ_API_KEY": "mock_key"}),          patch("groq.Groq") as mock_groq:
+        mock_groq.return_value.chat.completions.create.side_effect = [mock_resp1, mock_resp2]
+
+        # Turn 1
+        resp1 = client.post("/chat", json={
+            "job_id": completed_job,
+            "session_id": session_id,
+            "message": "Turn 1 question",
+        })
+        assert resp1.status_code == 200
+        assert resp1.json()["turn"] == 1
+
+        # Turn 2
+        resp2 = client.post("/chat", json={
+            "job_id": completed_job,
+            "session_id": session_id,
+            "message": "Turn 2 question",
+        })
+        assert resp2.status_code == 200
+        assert resp2.json()["turn"] == 2
+
+        # Query history
+        hist_resp = client.get(f"/chat/{completed_job}/history?session_id={session_id}")
+        assert hist_resp.status_code == 200
+        hist = hist_resp.json()
+        assert len(hist["turns"]) == 4  # 2 user + 2 assistant messages
+        assert hist["turns"][0]["content"] == "Turn 1 question"
+        assert hist["turns"][1]["content"] == "First reply."
+        assert hist["turns"][2]["content"] == "Turn 2 question"
+        assert hist["turns"][3]["content"] == "Second reply."
+
+
+def test_chat_missing_groq_api_key_returns_503(client, completed_job):
+    """POST /chat returns 503 when GROQ_API_KEY environment variable is not set."""
+    with patch.dict(os.environ, {}, clear=True):
+        resp = client.post("/chat", json={
+            "job_id": completed_job,
+            "message": "Any question",
+        })
+        assert resp.status_code == 503
+        assert "GROQ_API_KEY missing" in resp.json()["detail"]
