@@ -15,6 +15,7 @@ import os
 import json
 import uuid
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
@@ -37,14 +38,24 @@ try:
 except ImportError:
     _HAS_RASTERIO = False
 
-logger = logging.getLogger("luna_match_api")
+logger = logging.getLogger("luna-match")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(
-    title="LUNA-MATCH Registration API",
-    description="Sub-pixel Multi-Modal, Sun-Angle, and Scale-Invariant Lunar Image Correspondence API",
-    version="2.0.0",
-)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup checks
+    if not os.environ.get("GROQ_API_KEY"):
+        logger.warning("GROQ_API_KEY not set — /chat and /analyze will return 503")
+    else:
+        logger.info("GROQ_API_KEY configured — chat endpoints active")
+    model = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+    logger.info(f"Using GROQ_MODEL: {model}")
+    logger.info("CORS enabled: allow_origins=['*'], allow_methods=['*'], allow_headers=['*'] (open to all domains)")
+    yield
+
+
+app = FastAPI(title="LUNA-MATCH", lifespan=lifespan)
 
 # Enable CORS for frontend workbench integration
 # In-memory session store for multi-turn chat
