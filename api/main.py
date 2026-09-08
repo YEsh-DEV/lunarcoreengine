@@ -77,7 +77,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_executor = ThreadPoolExecutor(max_workers=4)
+_executor = ThreadPoolExecutor(max_workers=2)
 
 
 def create_checkerboard(img1: np.ndarray, img2: np.ndarray, tile_size: int = 36) -> np.ndarray:
@@ -185,14 +185,40 @@ def health_check():
     }
 
 
+def _ensure_memory_safe_image(file_path: str, max_dim: int = 640) -> str:
+    """Ensure image does not exceed max_dim to avoid OOM on memory-limited production tiers."""
+    try:
+        arr = cv2.imread(file_path, cv2.IMREAD_UNCHANGED)
+        if arr is not None:
+            h, w = arr.shape[:2]
+            if max(h, w) > max_dim:
+                scale = max_dim / float(max(h, w))
+                new_w, new_h = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+                resized = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                cv2.imwrite(file_path, resized)
+                logger.info(f"Memory safety: clamped {file_path} from ({w}x{h}) to ({new_w}x{new_h})")
+    except Exception as e:
+        logger.warning(f"Memory safety check skipped for {file_path}: {e}")
+    return file_path
+
+
 def _execute_pipeline_task(job_id: str, img_a_path: str, img_b_path: str):
     """Background runner for LunaMatchPipeline."""
     try:
+        _ensure_memory_safe_image(img_a_path, max_dim=640)
+        _ensure_memory_safe_image(img_b_path, max_dim=640)
         pipeline = LunaMatchPipeline(job_id, img_a_path, img_b_path)
         result = pipeline.run()
         logger.info(f"Job {job_id} finished with status: {result.get('status')}")
     except Exception as e:
         logger.error(f"Execution error for job {job_id}: {e}")
+        status_file = Path("data") / "jobs" / job_id / "status.json"
+        try:
+            status_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(status_file, "w") as f:
+                json.dump({"status": "FAILED", "error": str(e)}, f)
+        except Exception:
+            pass
 
 
 @app.post("/register", response_model=JobStatusResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -226,6 +252,7 @@ async def register_images(
             content = await file_a.read()
             with open(path_a, "wb") as f_out:
                 f_out.write(content)
+            _ensure_memory_safe_image(str(path_a), max_dim=640)
             img_a_path = str(path_a)
         elif "img_a_path" in form:
             img_a_path = str(form.get("img_a_path"))
@@ -235,6 +262,7 @@ async def register_images(
             content = await file_b.read()
             with open(path_b, "wb") as f_out:
                 f_out.write(content)
+            _ensure_memory_safe_image(str(path_b), max_dim=640)
             img_b_path = str(path_b)
         elif "img_b_path" in form:
             img_b_path = str(form.get("img_b_path"))
@@ -842,6 +870,16 @@ def orchestrate(req: OrchestrateRequest):
 
         if img_a is None or img_b is None:
             raise HTTPException(status_code=400, detail="Could not decode one or both base64 images.")
+
+        # Memory safety: clamp max dimension to 768px for Render 512MB RAM
+        for arr in [img_a, img_b]:
+            pass
+        if max(img_a.shape) > 640:
+            s = 640.0 / max(img_a.shape)
+            img_a = cv2.resize(img_a, (max(1, int(img_a.shape[1] * s)), max(1, int(img_a.shape[0] * s))), interpolation=cv2.INTER_AREA)
+        if max(img_b.shape) > 640:
+            s = 640.0 / max(img_b.shape)
+            img_b = cv2.resize(img_b, (max(1, int(img_b.shape[1] * s)), max(1, int(img_b.shape[0] * s))), interpolation=cv2.INTER_AREA)
 
         job_id = f"job_{uuid.uuid4().hex[:10]}"
         job_dir = Path("data") / "jobs" / job_id
